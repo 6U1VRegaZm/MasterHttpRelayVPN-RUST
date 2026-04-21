@@ -29,6 +29,12 @@ jobs:
           - target: x86_64-pc-windows-gnu
             os: windows-latest
             name: mhrv-rs-windows-amd64
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            name: mhrv-rs-linux-musl-amd64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            name: mhrv-rs-linux-musl-arm64
 
     runs-on: ${{ matrix.os }}
 
@@ -61,6 +67,7 @@ jobs:
           echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
           echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
 
+
       - name: Install Windows MinGW toolchain
         if: matrix.target == 'x86_64-pc-windows-gnu'
         id: msys2
@@ -80,13 +87,32 @@ jobs:
           Add-Content -Path $env:USERPROFILE/.cargo/config.toml -Value "linker = '$gcc'"
 
       - name: Build CLI
+        if: "!endsWith(matrix.target, '-linux-musl')"
         run: cargo build --release --target ${{ matrix.target }} --bin mhrv-rs
+
+      # Fully-static musl builds for OpenWRT / Alpine / libc-less systems.
+      # messense/rust-musl-cross ships a pre-built musl toolchain so `ring`
+      # (rustls' crypto backend) cross-compiles cleanly on both archs.
+      - name: Build CLI (musl via docker)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/src -w /src \
+            messense/rust-musl-cross:x86_64-musl \
+            cargo build --release --target x86_64-unknown-linux-musl --bin mhrv-rs
+
+      - name: Build CLI (musl via docker, arm64)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/src -w /src \
+            messense/rust-musl-cross:aarch64-musl \
+            cargo build --release --target aarch64-unknown-linux-musl --bin mhrv-rs
 
       # UI build: we try to build the UI binary on every platform. If it fails
       # on cross-compile for linux-arm64 (missing arm64 system libs cross),
-      # we still ship the CLI.
+      # we still ship the CLI. We also skip the UI on musl targets (OpenWRT etc.
+      # are headless, bundling X11 makes no sense).
       - name: Build UI
-        if: matrix.target != 'aarch64-unknown-linux-gnu'
+        if: matrix.target != 'aarch64-unknown-linux-gnu' && !endsWith(matrix.target, '-linux-musl')
         run: cargo build --release --target ${{ matrix.target }} --features ui --bin mhrv-rs-ui
 
       - name: Package (unix)
@@ -99,12 +125,22 @@ jobs:
             cp target/${{ matrix.target }}/release/mhrv-rs-ui dist/mhrv-rs-ui
             chmod +x dist/mhrv-rs-ui
           fi
-          cp assets/launchers/run.sh dist/run.sh
-          chmod +x dist/run.sh
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            cp assets/launchers/run.command dist/run.command
-            chmod +x dist/run.command
-          fi
+          # OpenWRT / musl archives get the procd init script instead of run.sh,
+          # since routers don't have a CA to install and run headless via procd.
+          case "${{ matrix.target }}" in
+            *-linux-musl)
+              cp assets/openwrt/mhrv-rs.init dist/mhrv-rs.init
+              chmod +x dist/mhrv-rs.init
+              ;;
+            *)
+              cp assets/launchers/run.sh dist/run.sh
+              chmod +x dist/run.sh
+              if [ "${{ runner.os }}" = "macOS" ]; then
+                cp assets/launchers/run.command dist/run.command
+                chmod +x dist/run.command
+              fi
+              ;;
+          esac
 
       - name: Build macOS .app bundle
         if: runner.os == 'macOS'
@@ -130,13 +166,20 @@ jobs:
         shell: bash
         run: |
           cd dist
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            7z a -tzip "${{ matrix.name }}.zip" mhrv-rs.exe mhrv-rs-ui.exe run.bat
-          elif [ "${{ runner.os }}" = "macOS" ]; then
-            tar czf "${{ matrix.name }}.tar.gz" mhrv-rs mhrv-rs-ui run.sh run.command
-          else
-            tar czf "${{ matrix.name }}.tar.gz" mhrv-rs mhrv-rs-ui run.sh 2>/dev/null || tar czf "${{ matrix.name }}.tar.gz" mhrv-rs run.sh
-          fi
+          case "${{ matrix.target }}" in
+            *-pc-windows-*)
+              7z a -tzip "${{ matrix.name }}.zip" mhrv-rs.exe mhrv-rs-ui.exe run.bat
+              ;;
+            *-apple-darwin)
+              tar czf "${{ matrix.name }}.tar.gz" mhrv-rs mhrv-rs-ui run.sh run.command
+              ;;
+            *-linux-musl)
+              tar czf "${{ matrix.name }}.tar.gz" mhrv-rs mhrv-rs.init
+              ;;
+            *)
+              tar czf "${{ matrix.name }}.tar.gz" mhrv-rs mhrv-rs-ui run.sh 2>/dev/null || tar czf "${{ matrix.name }}.tar.gz" mhrv-rs run.sh
+              ;;
+          esac
 
       - uses: actions/upload-artifact@v4
         with:
