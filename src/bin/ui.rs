@@ -104,6 +104,7 @@ struct FormState {
     socks5_port: String,
     log_level: String,
     verify_ssl: bool,
+    upstream_socks5: String,
     show_auth_key: bool,
 }
 
@@ -137,6 +138,7 @@ fn load_form() -> FormState {
             socks5_port: c.socks5_port.map(|p| p.to_string()).unwrap_or_default(),
             log_level: c.log_level,
             verify_ssl: c.verify_ssl,
+            upstream_socks5: c.upstream_socks5.unwrap_or_default(),
             show_auth_key: false,
         }
     } else {
@@ -150,6 +152,7 @@ fn load_form() -> FormState {
             socks5_port: "8086".into(),
             log_level: "info".into(),
             verify_ssl: true,
+            upstream_socks5: String::new(),
             show_auth_key: false,
         }
     }
@@ -201,6 +204,10 @@ impl FormState {
             verify_ssl: self.verify_ssl,
             hosts: std::collections::HashMap::new(),
             enable_batching: false,
+            upstream_socks5: {
+                let v = self.upstream_socks5.trim();
+                if v.is_empty() { None } else { Some(v.to_string()) }
+            },
         })
     }
 }
@@ -232,6 +239,8 @@ struct ConfigWire<'a> {
     verify_ssl: bool,
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     hosts: &'a std::collections::HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_socks5: Option<&'a str>,
 }
 
 #[derive(serde::Serialize)]
@@ -259,6 +268,7 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
             log_level: c.log_level.as_str(),
             verify_ssl: c.verify_ssl,
             hosts: &c.hosts,
+            upstream_socks5: c.upstream_socks5.as_deref(),
         }
     }
 }
@@ -356,6 +366,20 @@ impl eframe::App for App {
 
                     ui.label("SOCKS5 port");
                     ui.add(egui::TextEdit::singleline(&mut self.form.socks5_port).desired_width(80.0));
+                    ui.end_row();
+
+                    ui.label("Upstream SOCKS5")
+                        .on_hover_text(
+                            "Optional. host:port of an upstream SOCKS5 proxy (e.g. xray / v2ray / sing-box).\n\
+                             When set, non-HTTP / raw-TCP traffic arriving on the SOCKS5 listener is\n\
+                             chained through this proxy instead of connecting directly — this is what\n\
+                             makes Telegram MTProto, IMAP, SSH etc. actually tunnel.\n\
+                             HTTP/HTTPS traffic still routes through the Apps Script relay and the\n\
+                             SNI-rewrite tunnel as before."
+                        );
+                    ui.add(egui::TextEdit::singleline(&mut self.form.upstream_socks5)
+                        .hint_text("empty = direct; 127.0.0.1:50529 for a local xray")
+                        .desired_width(f32::INFINITY));
                     ui.end_row();
 
                     ui.label("Log level");

@@ -54,6 +54,14 @@ pub struct Config {
     pub hosts: HashMap<String, String>,
     #[serde(default)]
     pub enable_batching: bool,
+    /// Optional upstream SOCKS5 proxy for non-HTTP / raw-TCP traffic
+    /// (e.g. `"127.0.0.1:50529"` pointing at a local xray / v2ray instance).
+    /// When set, the SOCKS5 listener forwards raw-TCP flows through it
+    /// instead of connecting directly. HTTP/HTTPS traffic (which goes
+    /// through the Apps Script relay) and SNI-rewrite tunnels are
+    /// unaffected.
+    #[serde(default)]
+    pub upstream_socks5: Option<String>,
 }
 
 fn default_google_ip() -> String {

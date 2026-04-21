@@ -74,6 +74,7 @@ pub struct RewriteCtx {
     pub front_domain: String,
     pub hosts: std::collections::HashMap<String, String>,
     pub tls_connector: TlsConnector,
+    pub upstream_socks5: Option<String>,
 }
 
 impl ProxyServer {
@@ -100,6 +101,7 @@ impl ProxyServer {
             front_domain: config.front_domain.clone(),
             hosts: config.hosts.clone(),
             tls_connector,
+            upstream_socks5: config.upstream_socks5.clone(),
         });
 
         let socks5_port = config.socks5_port.unwrap_or(config.listen_port + 1);
@@ -326,7 +328,7 @@ async fn dispatch_tunnel(
         Ok(Err(_)) => return Ok(()),
         Err(_) => {
             // Client silent: likely a server-first protocol.
-            plain_tcp_passthrough(sock, &host, port).await;
+            plain_tcp_passthrough(sock, &host, port, rewrite_ctx.upstream_socks5.as_deref()).await;
             return Ok(());
         }
     };
@@ -345,32 +347,63 @@ async fn dispatch_tunnel(
         return Ok(());
     }
 
-    plain_tcp_passthrough(sock, &host, port).await;
+    plain_tcp_passthrough(sock, &host, port, rewrite_ctx.upstream_socks5.as_deref()).await;
     Ok(())
 }
 
 // ---------- Plain TCP passthrough ----------
 
-async fn plain_tcp_passthrough(mut sock: TcpStream, host: &str, port: u16) {
+async fn plain_tcp_passthrough(
+    mut sock: TcpStream,
+    host: &str,
+    port: u16,
+    upstream_socks5: Option<&str>,
+) {
     let target_host = host.trim_start_matches('[').trim_end_matches(']');
-    let upstream = match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        TcpStream::connect((target_host, port)),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            tracing::debug!("plain-tcp connect {}:{} failed: {}", host, port, e);
-            return;
+    let upstream = if let Some(proxy) = upstream_socks5 {
+        match socks5_connect_via(proxy, target_host, port).await {
+            Ok(s) => {
+                tracing::info!("tcp via upstream-socks5 {} -> {}:{}", proxy, host, port);
+                s
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "upstream-socks5 {} -> {}:{} failed: {} (falling back to direct)",
+                    proxy, host, port, e
+                );
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    TcpStream::connect((target_host, port)),
+                )
+                .await
+                {
+                    Ok(Ok(s)) => s,
+                    _ => return,
+                }
+            }
         }
-        Err(_) => {
-            tracing::debug!("plain-tcp connect {}:{} timeout", host, port);
-            return;
+    } else {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            TcpStream::connect((target_host, port)),
+        )
+        .await
+        {
+            Ok(Ok(s)) => {
+                tracing::info!("plain-tcp passthrough -> {}:{}", host, port);
+                s
+            }
+            Ok(Err(e)) => {
+                tracing::debug!("plain-tcp connect {}:{} failed: {}", host, port, e);
+                return;
+            }
+            Err(_) => {
+                tracing::debug!("plain-tcp connect {}:{} timeout", host, port);
+                return;
+            }
         }
     };
     let _ = upstream.set_nodelay(true);
-    tracing::info!("plain-tcp passthrough -> {}:{}", host, port);
     let (mut ar, mut aw) = sock.split();
     let (mut br, mut bw) = {
         let (r, w) = upstream.into_split();
@@ -382,6 +415,93 @@ async fn plain_tcp_passthrough(mut sock: TcpStream, host: &str, port: u16) {
         _ = t1 => {}
         _ = t2 => {}
     }
+}
+
+/// Open a TCP stream to `(host, port)` through an upstream SOCKS5 proxy
+/// (no-auth only). Returns the connected stream after SOCKS5 negotiation.
+async fn socks5_connect_via(
+    proxy: &str,
+    host: &str,
+    port: u16,
+) -> std::io::Result<TcpStream> {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    let mut s = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        TcpStream::connect(proxy),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))??;
+    let _ = s.set_nodelay(true);
+
+    // Greeting: VER=5, NMETHODS=1, METHOD=no-auth
+    s.write_all(&[0x05, 0x01, 0x00]).await?;
+    let mut reply = [0u8; 2];
+    s.read_exact(&mut reply).await?;
+    if reply[0] != 0x05 || reply[1] != 0x00 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("socks5 greet rejected: {:?}", reply),
+        ));
+    }
+
+    // CONNECT request: VER=5, CMD=1, RSV=0, ATYP=3 (domain) | 1 (IPv4) | 4 (IPv6)
+    let mut req: Vec<u8> = Vec::with_capacity(8 + host.len());
+    req.extend_from_slice(&[0x05, 0x01, 0x00]);
+    if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
+        req.push(0x01);
+        req.extend_from_slice(&v4.octets());
+    } else if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
+        req.push(0x04);
+        req.extend_from_slice(&v6.octets());
+    } else {
+        let hb = host.as_bytes();
+        if hb.len() > 255 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "hostname > 255",
+            ));
+        }
+        req.push(0x03);
+        req.push(hb.len() as u8);
+        req.extend_from_slice(hb);
+    }
+    req.extend_from_slice(&port.to_be_bytes());
+    s.write_all(&req).await?;
+
+    // Reply header: VER, REP, RSV, ATYP, BND.ADDR, BND.PORT
+    let mut head = [0u8; 4];
+    s.read_exact(&mut head).await?;
+    if head[0] != 0x05 || head[1] != 0x00 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("socks5 connect rejected rep=0x{:02x}", head[1]),
+        ));
+    }
+    // Skip BND.ADDR + BND.PORT.
+    match head[3] {
+        0x01 => {
+            let mut b = [0u8; 4 + 2];
+            s.read_exact(&mut b).await?;
+        }
+        0x04 => {
+            let mut b = [0u8; 16 + 2];
+            s.read_exact(&mut b).await?;
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            s.read_exact(&mut len).await?;
+            let mut name = vec![0u8; len[0] as usize + 2];
+            s.read_exact(&mut name).await?;
+        }
+        other => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("socks5 bad ATYP in reply: {}", other),
+            ));
+        }
+    }
+    Ok(s)
 }
 
 fn looks_like_http(first_bytes: &[u8]) -> bool {
