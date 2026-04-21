@@ -1,83 +1,128 @@
 # MasterHttpRelayVPN-RUST
 
-Rust port of [@masterking32's MasterHttpRelayVPN](https://github.com/masterking32/MasterHttpRelayVPN). **All credit for the original idea and the Python implementation goes to [@masterking32](https://github.com/masterking32).** This is a faithful Rust reimplementation of the `apps_script` mode packaged as a single static binary.
+Rust port of [@masterking32's MasterHttpRelayVPN](https://github.com/masterking32/MasterHttpRelayVPN). **All credit for the original idea and the Python implementation goes to [@masterking32](https://github.com/masterking32).** This is a faithful reimplementation of the `apps_script` mode, packaged as two tiny binaries (CLI + desktop UI) with no runtime dependencies.
 
-Free DPI bypass via Google Apps Script as a remote relay and TLS SNI concealment. Your ISP's censor sees traffic going to `www.google.com`; behind the scenes a free Google Apps Script fetches the real website for you.
+Free DPI bypass via Google Apps Script as a remote relay, with TLS SNI concealment. Your ISP's censor sees traffic going to `www.google.com`; behind the scenes a free Google Apps Script that you deploy in your own Google account fetches the real website for you.
 
-**[English Guide](#setup-guide)** | **[Persian Guide](#%D8%B1%D8%A7%D9%87%D9%86%D9%85%D8%A7%DB%8C-%D9%81%D8%A7%D8%B1%D8%B3%DB%8C)**
+**[English Guide](#setup-guide)** | **[راهنمای فارسی](#راهنمای-فارسی)**
 
 ## Why this exists
 
-The original Python project is excellent but requires Python + `pip install cryptography + h2` + runtime deps. For users in hostile networks, that install process is often itself broken (blocked PyPI, missing wheels, Windows without Python). This port is a single ~2.5 MB executable that you download and run. Nothing else.
+The original Python project is excellent but requires Python + `pip install cryptography h2` + system deps. For users in hostile networks that install process is often itself broken (blocked PyPI, missing wheels, Windows without Python). This port is a single ~2.5 MB executable that you download and run. Nothing else.
 
 ## How it works
 
 ```
-Browser -> mhrv-rs (local HTTP proxy) -> TLS to Google IP with SNI=www.google.com
-                                                |
-                                                | Host: script.google.com (inside TLS)
-                                                v
-                                         Apps Script relay (your free Google account)
-                                                |
-                                                v
-                                         Real destination
+Browser / Telegram / xray
+        |
+        | HTTP proxy (8085)  or  SOCKS5 (8086)
+        v
+mhrv-rs (local)
+        |
+        | TLS to Google IP, SNI = www.google.com
+        v                       ^
+   DPI sees www.google.com      |
+        |                       | Host: script.google.com (inside TLS)
+        v                       |
+  Google edge frontend ---------+
+        |
+        v
+  Apps Script relay (your free Google account)
+        |
+        v
+  Real destination
 ```
 
-The censor's DPI sees `www.google.com` in the TLS SNI and lets it through. Google's frontend hosts both `www.google.com` and `script.google.com` on the same IP and routes by the HTTP Host header inside the encrypted stream.
+The censor's DPI sees `www.google.com` in the TLS SNI and lets it through. Google's frontend hosts both `www.google.com` and `script.google.com` on the same IP and routes by the HTTP `Host` header inside the encrypted stream.
+
+For a handful of Google-owned domains (`google.com`, `youtube.com`, `fonts.googleapis.com`, …) the same tunnel is used directly instead of going through the Apps Script relay. This bypasses the per-fetch quota and fixes the "User-Agent is always `Google-Apps-Script`" problem for those domains. You can add more domains via the `hosts` map in config.
 
 ## Platforms
 
-Linux (x86_64/aarch64), macOS (x86_64/aarch64), Windows (x86_64). Prebuilt binaries on the [releases page](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases).
+Linux (x86_64, aarch64), macOS (x86_64, aarch64), Windows (x86_64). Prebuilt binaries on the [releases page](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases).
 
-## CLI or UI
+## What's in a release
 
-Each release ships two binaries:
+Each archive contains two binaries and a launcher script:
 
-- **`mhrv-rs`** — the CLI. Always works. Headless servers, Docker, automation. No system deps on macOS/Windows; on Linux works even without a display server.
-- **`mhrv-rs-ui`** — the desktop UI (egui). Form for the config, Start/Stop/Test buttons, live stats, recent log. macOS releases also include `mhrv-rs.app` (double-click to launch). Linux UI requires a display server and common desktop libraries (`libxkbcommon`, `libwayland-client`, `libxcb`, `libgl`, `libx11`, `libgtk-3`); install them via your distro's package manager if missing.
+| file | purpose |
+|---|---|
+| `mhrv-rs` / `mhrv-rs.exe` | CLI. Headless use, servers, automation. Works on all platforms; no system deps on macOS/Windows. |
+| `mhrv-rs-ui` / `mhrv-rs-ui.exe` | Desktop UI (egui). Config form, Start/Stop/Test buttons, live stats, log panel. |
+| `run.sh` / `run.command` / `run.bat` | Platform launcher: installs the MITM CA (needs sudo/admin) and then starts the UI. Use this on first run. |
 
-On first run the MITM CA must be installed into the system trust store (this typically needs sudo/admin), and this is easiest to do from the CLI. Each archive therefore ships a launcher that does both steps in order:
+macOS archives also ship `mhrv-rs.app` (in `*-app.zip`) — double-click to launch the UI without a terminal. You'll still need to run the CLI (`mhrv-rs --install-cert`) or `run.command` once to install the CA.
 
-- Linux: `./run.sh`
-- macOS: `./run.command` (double-click in Finder) or `./run.sh` from a terminal
-- Windows: `run.bat`
+Linux UI also needs common desktop libraries available: `libxkbcommon`, `libwayland-client`, `libxcb`, `libgl`, `libx11`, `libgtk-3`. On most desktop distros these are already present; on a headless box install them via your package manager, or just use the CLI.
 
-The launchers run `mhrv-rs --install-cert` once, then start `mhrv-rs-ui`. Subsequent runs can launch the UI directly.
+## Where things live
 
-Config + the MITM CA live in the platform user-data dir:
+Config and the MITM CA live in the OS user-data dir:
 
 - macOS: `~/Library/Application Support/mhrv-rs/`
 - Linux: `~/.config/mhrv-rs/`
 - Windows: `%APPDATA%\mhrv-rs\`
 
-The CLI also falls back to `./config.json` in the current directory for backward compatibility.
+Inside that dir:
+
+- `config.json` — your settings (written by the UI's **Save** button or hand-edited)
+- `ca/ca.crt`, `ca/ca.key` — the MITM root certificate. Only you have the private key.
+
+The CLI also falls back to `./config.json` in the current directory for backward compatibility with older setups.
 
 ## Setup Guide
 
-### Step 1: Deploy the Apps Script relay (one-time)
+### Step 1 — Deploy the Apps Script relay (one-time)
 
-This part is unchanged from the original project. Follow @masterking32's guide, or the summary below:
+This part is unchanged from the original project. Follow @masterking32's guide or the summary below:
 
-1. Open <https://script.google.com> with your Google account
-2. **New project**, delete the default code
-3. Copy the contents of [`Code.gs` from the original repo](https://github.com/masterking32/MasterHttpRelayVPN/blob/python_testing/Code.gs) ([raw link](https://raw.githubusercontent.com/masterking32/MasterHttpRelayVPN/refs/heads/python_testing/Code.gs)) into the editor
-4. **Change** the line `const AUTH_KEY = "..."` to a strong secret only you know
-5. **Deploy → New deployment → Web app**
+1. Open <https://script.google.com> while signed into your Google account.
+2. **New project**, delete the default code.
+3. Copy the contents of [`Code.gs` from the original repo](https://github.com/masterking32/MasterHttpRelayVPN/blob/python_testing/Code.gs) ([raw](https://raw.githubusercontent.com/masterking32/MasterHttpRelayVPN/refs/heads/python_testing/Code.gs)) into the editor.
+4. Change `const AUTH_KEY = "..."` to a strong secret only you know.
+5. **Deploy → New deployment → Web app**.
    - Execute as: **Me**
    - Who has access: **Anyone**
-6. Copy the **Deployment ID** (long random string in the URL).
+6. Copy the **Deployment ID** (the long random string in the URL).
 
-### Step 2: Download mhrv-rs
+### Step 2 — Download
 
-Download the right binary from the [releases page](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases) for your platform. Or build from source:
+Grab the archive for your platform from the [releases page](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases) and extract it.
+
+Or build from source:
 
 ```bash
-cargo build --release
+cargo build --release --features ui
+# Binaries: target/release/mhrv-rs and target/release/mhrv-rs-ui
 ```
 
-### Step 3: Configure
+### Step 3 — First run
 
-Copy `config.example.json` to `config.json` and fill in your values:
+The launcher handles the one-time CA install, then starts the UI:
+
+| platform | how |
+|---|---|
+| macOS | double-click `run.command` in Finder (or `./run.command` in a terminal) |
+| Linux | `./run.sh` from a terminal |
+| Windows | double-click `run.bat` |
+
+It will ask for your password (sudo / UAC) to add the MITM root to the system trust store. After that the CA is trusted and you can launch the UI directly next time.
+
+### Step 4 — Configure in the UI
+
+Open the UI and fill in the form:
+
+- **Apps Script ID** — the Deployment ID from Step 1. Comma-separate multiple IDs for round-robin rotation across several deployments (higher quota, more throughput).
+- **Auth key** — the same secret you set in `Code.gs`.
+- **Google IP** — `216.239.38.120` is a solid default. Use the **scan** button to probe for a faster one from your network.
+- **Front domain** — keep `www.google.com`.
+- **HTTP port** / **SOCKS5 port** — defaults `8085` / `8086`.
+
+Hit **Save**, then **Start**. Use **Test** any time to send one request end-to-end through the relay and report the result.
+
+### Step 4 (alternative) — CLI only
+
+Everything the UI does is also available in the CLI. Copy `config.example.json` to `config.json` (either next to the binary or into the user-data dir shown above), fill it in:
 
 ```json
 {
@@ -88,99 +133,92 @@ Copy `config.example.json` to `config.json` and fill in your values:
   "auth_key": "same-secret-as-in-code-gs",
   "listen_host": "127.0.0.1",
   "listen_port": 8085,
+  "socks5_port": 8086,
   "log_level": "info",
   "verify_ssl": true
 }
 ```
 
-`script_id` can also be an array of IDs for round-robin rotation across multiple deployments (higher quota, more throughput).
-
-### Step 4: Install the MITM CA (one-time)
-
-The tool needs to decrypt your browser's HTTPS locally so it can forward each request through the Apps Script relay. First run generates a local CA; install it as trusted:
+Then:
 
 ```bash
-# Linux / macOS
-sudo ./mhrv-rs --install-cert
-
-# Windows (Administrator)
-mhrv-rs.exe --install-cert
+./mhrv-rs                   # serve (default)
+./mhrv-rs test              # one-shot end-to-end probe
+./mhrv-rs scan-ips          # rank Google frontend IPs by latency
+./mhrv-rs --install-cert    # reinstall the MITM CA
+./mhrv-rs --help
 ```
 
-The CA is saved at `./ca/ca.crt` — only you have the private key.
+`script_id` can also be a JSON array: `["id1", "id2", "id3"]`.
 
-### Step 5: Run
+### Step 5 — Point your client at the proxy
 
-```bash
-./mhrv-rs --config config.json      # Linux/macOS
-mhrv-rs.exe --config config.json    # Windows
-```
+The tool listens on **two** ports. Use whichever your client supports:
 
-### Diagnostic subcommands
+**HTTP proxy** (browsers, generic HTTP clients) — `127.0.0.1:8085`
 
-- **`mhrv-rs test`** — send one request through the relay and report success/timing. Useful when setting up or debugging. Does not need the proxy to be running.
-- **`mhrv-rs scan-ips`** — parallel TLS probe of known Google frontend IPs, sorted by latency. Swap the winning IP into your `google_ip` config field for best performance.
+- **Firefox** — Settings → Network Settings → **Manual proxy**. HTTP host `127.0.0.1`, port `8085`, tick **Also use this proxy for HTTPS**.
+- **Chrome / Edge** — use the system proxy settings, or the **Proxy SwitchyOmega** extension.
+- **macOS system-wide** — System Settings → Network → Wi-Fi → Details → Proxies → enable **Web Proxy (HTTP)** and **Secure Web Proxy (HTTPS)**, both `127.0.0.1:8085`.
+- **Windows system-wide** — Settings → Network & Internet → Proxy → **Manual proxy setup**, address `127.0.0.1`, port `8085`.
 
-### Step 6: Point your client at the proxy
+**SOCKS5 proxy** (Telegram, xray, app-level clients) — `127.0.0.1:8086`, no auth.
 
-The tool listens on **two** ports:
-- **HTTP proxy** on `listen_port` (default `8085`) — for browsers / any HTTP-aware client
-- **SOCKS5 proxy** on `socks5_port` (default `listen_port + 1`, i.e. `8086`) — for xray / Telegram / app-level clients
+- Works for HTTP, HTTPS, **and** non-HTTP protocols (Telegram's MTProto, raw TCP). The server auto-detects each connection and falls back to plain TCP passthrough when the payload isn't HTTP.
 
-**Browser (HTTP proxy):**
-- **Firefox**: Settings → Network Settings → Manual proxy → HTTP `127.0.0.1:8085`, check "Also use this proxy for HTTPS"
-- **Chrome/Edge**: System proxy settings, or SwitchyOmega
-- **macOS system-wide**: System Settings → Network → Wi-Fi → Details → Proxies → Web + Secure Web Proxy
+## Diagnostics
 
-**xray / Telegram (SOCKS5):**
-- Point the SOCKS5 setting at `127.0.0.1:8086`, no auth.
-- Non-HTTP protocols (MTProto, raw TCP) fall back to plain-TCP passthrough automatically.
+- **`mhrv-rs test`** — sends one request through the relay and reports success/latency. Use this first whenever something breaks — it isolates "relay is up" from "client config is wrong".
+- **`mhrv-rs scan-ips`** — parallel TLS probe of 28 known Google frontend IPs, sorted by latency. Take the winner and put it in `google_ip`. The UI has the same thing behind the **scan** button next to the Google IP field.
+- **Periodic stats** are logged every 60 s at `info` level (relay calls, cache hit rate, bytes relayed, active vs. blacklisted scripts). The UI shows them live.
 
-## What's implemented vs not
+## What's implemented vs. not
 
-This port focuses on the **`apps_script` mode** which is the only one that reliably works in 2026. Implemented:
+This port focuses on the **`apps_script` mode** — the only one that reliably works against a modern censor in 2026. Implemented:
 
 - [x] Local HTTP proxy (CONNECT for HTTPS, plain forwarding for HTTP)
+- [x] Local SOCKS5 proxy with smart TLS/HTTP/raw-TCP dispatch (Telegram, xray, etc.)
 - [x] MITM with on-the-fly per-domain cert generation via `rcgen`
 - [x] CA generation + auto-install on macOS / Linux / Windows
-- [x] Firefox NSS cert install (best effort via `certutil`)
+- [x] Firefox NSS cert install (best-effort via `certutil`)
 - [x] Apps Script JSON relay, protocol-compatible with `Code.gs`
-- [x] Connection pooling (45s TTL, max 20 idle)
+- [x] Connection pooling (45 s TTL, max 20 idle)
 - [x] Gzip response decoding
 - [x] Multi-script round-robin
 - [x] Auto-blacklist failing scripts on 429 / quota errors (10-minute cooldown)
-- [x] Response cache (50 MB, FIFO + TTL, parses `Cache-Control: max-age`, heuristics for static assets)
+- [x] Response cache (50 MB, FIFO + TTL, `Cache-Control: max-age` aware, heuristics for static assets)
 - [x] Request coalescing: concurrent identical GETs share one upstream fetch
-- [x] SNI-rewrite tunnels (direct-to-Google-edge bypassing the relay) for `google.com`, `youtube.com`, `youtu.be`, `youtube-nocookie.com`, `fonts.googleapis.com`. Extra domains can be added via the `hosts` map in config — see "Known limitations" below.
+- [x] SNI-rewrite tunnels (direct to Google edge, bypassing the relay) for `google.com`, `youtube.com`, `youtu.be`, `youtube-nocookie.com`, `fonts.googleapis.com`. Extra domains configurable via the `hosts` map.
 - [x] Automatic redirect handling on the relay (`/exec` → `googleusercontent.com`)
-- [x] Header filtering (strip connection-specific + brotli)
-- [x] `mhrv-rs test` subcommand — one-shot end-to-end relay probe
-- [x] `mhrv-rs scan-ips` subcommand — parallel probe 28 Google frontend IPs, sorted by latency
-- [x] Periodic stats log every 60 s (relay calls, cache hit rate, bytes, active scripts)
-- [x] Script IDs masked in logs (prefix...suffix) so `info` logs don't leak deployment IDs
+- [x] Header filtering (strip connection-specific, brotli)
+- [x] `test` and `scan-ips` subcommands
+- [x] Script IDs masked in logs (`prefix…suffix`) so `info` logs don't leak deployment IDs
+- [x] Desktop UI (egui) — cross-platform, no bundler needed
 
-Intentionally NOT implemented (rationale included so future contributors don't spend cycles on them):
+Intentionally **not** implemented (rationale included so future contributors don't spend cycles on them):
 
-- [ ] **HTTP/2 multiplexing** — `h2` crate state machine (stream IDs, flow control, GOAWAY) has too many subtle hang cases; coalescing + 20-connection pool already gets most of the benefit for this workload
-- [ ] **Request batching (`q:[...]` mode)** — our connection pool + tokio async already parallelizes well; batching adds ~200 lines of state management with unclear incremental gain over the current flow
-- [ ] **Range-based parallel download** — edge cases (non-Range servers, chunked mid-stream, content-encoding) are real; YouTube-style video already bypasses Apps Script via SNI-rewrite tunnel
-- [ ] **Other modes** (`domain_fronting`, `google_fronting`, `custom_domain`) — Cloudflare killed generic domain fronting in 2024; Cloud Run needs paid plan; skip unless specifically requested
+- **HTTP/2 multiplexing** — the `h2` crate state machine (stream IDs, flow control, GOAWAY) has too many subtle hang cases; coalescing + 20-connection pool already gets most of the benefit for this workload.
+- **Request batching (`q:[...]` mode)** — our connection pool + tokio async already parallelizes well; batching adds ~200 lines of state management with unclear incremental gain.
+- **Range-based parallel download** — edge cases (non-Range servers, chunked mid-stream, content-encoding) are real; YouTube-style video already bypasses Apps Script via SNI-rewrite tunnel.
+- **Other modes** (`domain_fronting`, `google_fronting`, `custom_domain`) — Cloudflare killed generic domain fronting in 2024; Cloud Run needs a paid plan. Skip unless specifically requested.
 
 ## Known limitations
 
-These are inherent to the Apps Script + domain-fronting approach, not bugs in this client. Same issues exist in the original Python version.
+These are inherent to the Apps Script + domain-fronting approach, not bugs in this client. The original Python version has the same issues.
 
-- **User-Agent is fixed to `Google-Apps-Script`** for any request going through the relay. Google's `UrlFetchApp.fetch()` does not allow overriding it. Consequence: sites that detect bots (e.g., `google.com` search, some CAPTCHAs) will serve degraded / no-JavaScript fallback pages to relayed requests. Workaround: add the affected domain to the `hosts` map in `config.json` so it's routed via the SNI-rewrite tunnel (real browser UA) instead of the relay. `google.com`, `youtube.com`, `fonts.googleapis.com` are already done by default.
+- **User-Agent is fixed to `Google-Apps-Script`** for anything going through the relay. `UrlFetchApp.fetch()` does not allow overriding it. Consequence: sites that detect bots (e.g., Google search, some CAPTCHA flows) serve degraded / no-JS fallback pages to relayed requests. Workaround: add the affected domain to the `hosts` map so it's routed through the SNI-rewrite tunnel with your real browser's UA instead. `google.com`, `youtube.com`, `fonts.googleapis.com` are already there by default.
+- **Video playback is slow and quota-limited** for anything that goes through the relay. YouTube HTML loads through the tunnel (fast), but chunks from `googlevideo.com` go through Apps Script. Each Apps Script consumer account has a ~2 M `UrlFetchApp` calls/day quota and a 50 MB body limit per fetch. Fine for text browsing, painful for 1080p. Rotate multiple `script_id`s for more headroom, or use a real VPN for video.
+- **Brotli is stripped** from forwarded `Accept-Encoding` headers. Apps Script can decompress gzip, but not `br`, and forwarding `br` produces garbled responses. Minor size overhead.
+- **WebSockets don't work** through the relay — it's single request/response JSON. Sites that upgrade to WS fail (ChatGPT streaming, Discord voice, etc.).
+- **HSTS-preloaded / hard-pinned sites** will reject the MITM cert. Most sites are fine because the CA is trusted; a handful aren't.
+- **Google / YouTube 2FA and sensitive logins** may trigger "unrecognized device" warnings because requests originate from Google's Apps Script IPs, not yours. Log in once via the tunnel (`google.com` is in the rewrite list) to avoid this.
 
-- **Video playback is slow and quota-limited** for anything that goes through the relay. YouTube HTML loads via the tunnel (fast) but chunks from `googlevideo.com` go through Apps Script. Each Apps Script account has a ~2 million `UrlFetchApp` calls/day consumer quota and a 50 MB body limit per fetch. Fine for text browsing, painful for 1080p video. Use multiple `script_id`s in rotation for more headroom, or use a real VPN for video.
+## Security posture
 
-- **Brotli compression is stripped** from forwarded `Accept-Encoding` headers. Apps Script can decompress gzip but not brotli; forwarding `br` would produce garbled responses. Gzip still works. Minor size overhead for responses that would've been brotli.
-
-- **WebSockets don't work** through Apps Script (the relay does single request/response JSON). Sites that upgrade to WS fail. This covers `chat.openai.com` streaming, Discord voice, etc.
-
-- **HTTPS sites your browser has pinned** (HSTS preloaded list, extended validation) will reject the MITM cert. Most sites work fine because we install our CA as trusted; a few hard-pinned ones won't.
-
-- **Google/YouTube 2FA / sensitive logins** may see "unrecognized device" warnings because the request originates from Google's Apps Script infrastructure IP, not your real IP. Log in via tunnel first (`google.com` is in the rewrite list) to avoid this.
+- The MITM root stays **on your machine only**. The `ca/ca.key` private key is generated locally and never leaves the user-data dir.
+- `auth_key` between the client and the Apps Script relay is a shared secret you pick. The server-side `Code.gs` rejects requests without a matching key.
+- Traffic between your machine and Google's edge is standard TLS 1.3.
+- What Google can see: the destination URL and headers of each request (because Apps Script fetches on your behalf). This is the same trust model as any hosted proxy — if that's not acceptable, use a self-hosted VPN instead.
 
 ## License
 
@@ -188,81 +226,138 @@ MIT. See [LICENSE](LICENSE).
 
 ## Credit
 
-Original project: <https://github.com/masterking32/MasterHttpRelayVPN> by [@masterking32](https://github.com/masterking32). The idea, the Google Apps Script protocol, the proxy architecture, and the ongoing maintenance are all his. This Rust port exists only to make the client-side distribution easier.
+Original project: <https://github.com/masterking32/MasterHttpRelayVPN> by [@masterking32](https://github.com/masterking32). The idea, the Google Apps Script protocol, the proxy architecture, and the ongoing maintenance are all his. This Rust port exists purely to make client-side distribution easier.
 
 ---
 
+<div dir="rtl">
+
 ## راهنمای فارسی
 
-پورت Rust پروژه [MasterHttpRelayVPN](https://github.com/masterking32/MasterHttpRelayVPN) از [@masterking32](https://github.com/masterking32). **تمام اعتبار ایده و نسخه اصلی Python متعلق به ایشان است.** این نسخه فقط مدل `apps_script` را به‌صورت یک فایل اجرایی مستقل (بدون نیاز به نصب Python) ارائه می‌دهد.
+پورت Rust پروژهٔ [MasterHttpRelayVPN](https://github.com/masterking32/MasterHttpRelayVPN) از [@masterking32](https://github.com/masterking32). **تمام اعتبار ایده و پیاده‌سازی اصلی پایتون متعلق به ایشان است.** این نسخه فقط مدل `apps_script` را به‌صورت دو فایل اجرایی کوچک (CLI + رابط گرافیکی) بدون هیچ وابستگی run-time ارائه می‌دهد.
+
+عبور رایگان از DPI با استفاده از Google Apps Script به‌عنوان رله، به‌همراه مخفی‌سازی SNI در TLS. سانسور ISP فکر می‌کند ترافیک شما به سمت `www.google.com` می‌رود؛ در پشت صحنه یک Apps Script که خودتان در اکانت گوگل خودتان دیپلوی کرده‌اید سایت اصلی را برای شما واکشی می‌کند.
 
 ### چرا این نسخه؟
 
-نسخه اصلی Python عالی است ولی نیاز به Python + نصب `cryptography` و `h2` دارد. برای کاربرانی که PyPI فیلتر شده یا Python ندارند، این فرایند خودش مشکل است. این پورت فقط یک فایل ~۲.۵ مگابایتی است که دانلود می‌کنید و اجرا می‌کنید.
+نسخهٔ اصلی پایتون عالی است، اما نیاز به Python + نصب `cryptography` و `h2` و چند وابستگی سیستمی دارد. برای کاربرانی که PyPI فیلتر است یا Python ندارند این فرآیند خودش یک دردسر است. این پورت فقط یک فایل اجرایی ~۲.۵ مگابایتی است که دانلود می‌کنید و اجرا می‌کنید. تمام.
 
-### نحوه کار
+### نحوهٔ کار
 
-مرورگر شما با این ابزار به‌عنوان HTTP proxy صحبت می‌کند. ابزار ترافیک را از طریق TLS به IP گوگل می‌فرستد ولی SNI را `www.google.com` می‌گذارد. داخل TLS رمزگذاری‌شده، HTTP request به `script.google.com` می‌رود. DPI فقط `www.google.com` را می‌بیند. Apps Script سایت مقصد را واکشی و پاسخ را برمی‌گرداند.
+مرورگر/تلگرام/xray شما با این ابزار به‌عنوان HTTP proxy یا SOCKS5 proxy صحبت می‌کند. ابزار ترافیک را از طریق TLS به یک IP گوگل می‌فرستد، اما SNI را `www.google.com` می‌گذارد. داخل TLS رمزگذاری‌شده، header به‌نام `Host: script.google.com` رد می‌شود. DPI فقط `www.google.com` را می‌بیند و اجازه عبور می‌دهد. Apps Script سایت مقصد را واکشی می‌کند و پاسخ را به شما بازمی‌گرداند.
+
+برای چند دامنهٔ متعلق به خود گوگل (`google.com`، `youtube.com`، `fonts.googleapis.com` و …) از همین تونل مستقیم استفاده می‌شود بدون عبور از Apps Script. این کار هم مشکل سهمیهٔ Apps Script را حل می‌کند و هم مشکل «User-Agent همیشه Google-Apps-Script است» را برای این دامنه‌ها از بین می‌برد. می‌توانید دامنه‌های بیشتری را از طریق `hosts` در config اضافه کنید.
+
+### پلتفرم‌ها
+
+لینوکس (x86_64، aarch64)، مک‌اواس (x86_64، aarch64)، ویندوز (x86_64). فایل‌های آماده در [صفحهٔ releases](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases).
+
+### محتوای هر release
+
+هر آرشیو شامل دو باینری و یک اسکریپت راه‌انداز است:
+
+- `mhrv-rs` / `mhrv-rs.exe` — نسخهٔ CLI، برای سرور و استفادهٔ headless.
+- `mhrv-rs-ui` / `mhrv-rs-ui.exe` — رابط گرافیکی دسکتاپ (egui). فرم تنظیمات، دکمه‌های Start/Stop/Test، آمار زنده، لاگ.
+- `run.sh` / `run.command` / `run.bat` — اسکریپت راه‌انداز مخصوص هر سیستم‌عامل: اول CA را نصب می‌کند (نیاز به sudo/Administrator) بعد UI را اجرا می‌کند. **بار اول حتماً همین را اجرا کنید.**
+
+نسخهٔ مک آرشیو `*-app.zip` هم دارد که داخلش `mhrv-rs.app` است — با دو بار کلیک از Finder اجرا می‌شود. ولی بار اول باید CA را نصب کنید (با `mhrv-rs --install-cert` یا همان `run.command`).
+
+### مسیر فایل‌ها
+
+Config و ریشهٔ MITM در پوشهٔ کاربر سیستم‌عامل قرار می‌گیرند:
+
+- مک: `~/Library/Application Support/mhrv-rs/`
+- لینوکس: `~/.config/mhrv-rs/`
+- ویندوز: `%APPDATA%\mhrv-rs\`
+
+داخل این پوشه: `config.json`، `ca/ca.crt` (گواهی عمومی) و `ca/ca.key` (کلید خصوصی — فقط روی سیستم شماست و هرگز جایی ارسال نمی‌شود).
 
 ### مراحل راه‌اندازی
 
-#### ۱. راه‌اندازی Apps Script (یک‌بار)
+#### ۱. دیپلوی Apps Script (یک بار)
 
-این بخش دقیقاً همان نسخه اصلی است:
+این بخش دقیقاً همان نسخهٔ اصلی است:
 
-1. به <https://script.google.com> بروید و با اکانت گوگل وارد شوید
-2. **New project** بزنید، کد پیش‌فرض را پاک کنید
-3. محتوای [`Code.gs`](https://github.com/masterking32/MasterHttpRelayVPN/blob/python_testing/Code.gs) ([لینک raw](https://raw.githubusercontent.com/masterking32/MasterHttpRelayVPN/refs/heads/python_testing/Code.gs)) را از ریپو اصلی کپی کنید و Paste کنید
-4. در خط `const AUTH_KEY = "..."` رمز را به یک مقدار قوی و مخصوص خودتان تغییر دهید
-5. **Deploy → New deployment → Web app**
+۱. به <https://script.google.com> بروید و با اکانت گوگل وارد شوید.
+۲. **New project** بزنید و کد پیش‌فرض را پاک کنید.
+۳. محتوای [`Code.gs`](https://github.com/masterking32/MasterHttpRelayVPN/blob/python_testing/Code.gs) ([لینک raw](https://raw.githubusercontent.com/masterking32/MasterHttpRelayVPN/refs/heads/python_testing/Code.gs)) را از ریپو اصلی کپی و Paste کنید.
+۴. خط `const AUTH_KEY = "..."` را به یک رمز قوی و مختص خودتان تغییر دهید.
+۵. **Deploy → New deployment → Web app**
    - Execute as: **Me**
    - Who has access: **Anyone**
-6. **Deployment ID** (رشته تصادفی طولانی) را کپی کنید
+۶. **Deployment ID** را کپی کنید (رشتهٔ تصادفی طولانی داخل URL).
 
-#### ۲. دانلود mhrv-rs
+#### ۲. دانلود
 
-از [صفحه releases](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases) باینری پلتفرم خود را دانلود کنید.
+آرشیو پلتفرم خود را از [صفحهٔ releases](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases) بگیرید و extract کنید.
 
-#### ۳. تنظیمات
+#### ۳. اجرای بار اول
 
-فایل `config.example.json` را به `config.json` کپی کنید و مقادیر را پر کنید. `script_id` می‌تواند یک رشته یا آرایه‌ای از رشته‌ها باشد (برای چرخش بین چند deployment).
+- **مک**: روی `run.command` دو بار کلیک کنید (یا از ترمینال `./run.command`).
+- **لینوکس**: در ترمینال `./run.sh`.
+- **ویندوز**: روی `run.bat` دو بار کلیک کنید.
 
-#### ۴. نصب CA (یک‌بار)
+اسکریپت رمز شما را می‌خواهد (sudo یا UAC) تا CA داخل trust store سیستم نصب شود. بعد از این کار UI باز می‌شود و در اجراهای بعدی می‌توانید مستقیماً خود UI یا `mhrv-rs.app` را اجرا کنید.
 
-ابزار باید TLS مرورگر شما را محلی رمزگشایی کند. بار اول یک CA می‌سازد که باید trust کنید:
+#### ۴. تنظیمات در UI
+
+فرم را پر کنید:
+
+- **Apps Script ID** — همان Deployment ID مرحلهٔ ۱. برای استفاده از چند deployment به‌صورت round-robin، با کاما جدا کنید.
+- **Auth key** — همان رمز `AUTH_KEY` داخل `Code.gs`.
+- **Google IP** — پیش‌فرض `216.239.38.120` خوب است. دکمهٔ **scan** کنارش IPهای دیگر گوگل را از شبکهٔ شما تست می‌کند و سریع‌ترین را معرفی می‌کند.
+- **Front domain** — همان `www.google.com` را نگه دارید.
+- **HTTP port** / **SOCKS5 port** — پیش‌فرض‌ها `8085` و `8086`.
+
+**Save** بعد **Start**. دکمهٔ **Test** در هر زمان یک درخواست کامل از طریق رله می‌فرستد و نتیجه را گزارش می‌دهد.
+
+#### ۴ (جایگزین). فقط CLI
+
+هر کاری که UI می‌کند از CLI هم قابل انجام است. `config.example.json` را به `config.json` کپی و مقادیر را پر کنید، بعد:
 
 ```bash
-# لینوکس/مک
-sudo ./mhrv-rs --install-cert
-
-# ویندوز (Administrator)
-mhrv-rs.exe --install-cert
+./mhrv-rs                   # اجرای proxy
+./mhrv-rs test              # تست یک درخواست کامل
+./mhrv-rs scan-ips          # رتبه‌بندی IPهای گوگل بر اساس تأخیر
+./mhrv-rs --install-cert    # نصب مجدد CA
+./mhrv-rs --help
 ```
 
-#### ۵. اجرا
+#### ۵. تنظیم proxy در کلاینت
 
-```bash
-./mhrv-rs --config config.json
-```
+ابزار روی **دو** پورت گوش می‌دهد:
 
-#### ۶. تنظیم proxy در مرورگر
+**HTTP proxy** (مرورگرها) — `127.0.0.1:8085`
 
-Proxy مرورگر را روی `127.0.0.1:8085` بگذارید (هم HTTP و هم HTTPS).
+- **Firefox** — Settings → Network Settings → **Manual proxy**. HTTP برابر `127.0.0.1`، port `8085`، تیک **Also use this proxy for HTTPS**.
+- **Chrome / Edge** — از تنظیمات proxy سیستم یا افزونهٔ **Proxy SwitchyOmega** استفاده کنید.
+- **مک (system-wide)** — System Settings → Network → Wi-Fi → Details → Proxies → **Web Proxy (HTTP)** و **Secure Web Proxy (HTTPS)** را فعال کنید، هر دو `127.0.0.1:8085`.
+- **ویندوز (system-wide)** — Settings → Network & Internet → Proxy → **Manual proxy setup**، address `127.0.0.1`، port `8085`.
+
+**SOCKS5 proxy** (تلگرام، xray، کلاینت‌های app-level) — `127.0.0.1:8086`، بدون auth.
+
+برای HTTP و HTTPS و **هم** پروتکل‌های غیر-HTTP (MTProto تلگرام، TCP خام) کار می‌کند. ابزار به‌صورت هوشمند تشخیص می‌دهد و اگر ترافیک HTTP نبود، به‌صورت plain TCP passthrough می‌فرستد.
 
 ### محدودیت‌های شناخته‌شده
 
-این‌ها محدودیت‌های ذاتی روش Apps Script هستند، نه باگ در این کلاینت. نسخه اصلی Python هم همین مشکلات را دارد.
+این‌ها محدودیت‌های ذاتی روش Apps Script + SNI هستند، نه باگ در این کلاینت. نسخهٔ اصلی پایتون هم دقیقاً همین‌ها را دارد.
 
-- **User-Agent همیشه `Google-Apps-Script` است** برای هر درخواستی که از رله رد می‌شود. `UrlFetchApp.fetch()` گوگل اجازه تغییر این را نمی‌دهد. نتیجه: سایت‌هایی که ربات را تشخیص می‌دهند (مثل جست‌وجوی `google.com`، بعضی CAPTCHA‌ها) نسخه ساده بدون JS را سرو می‌کنند. راه‌حل: دامنه مورد نظر را به `hosts` در `config.json` اضافه کنید تا از مسیر SNI-rewrite (با UA واقعی مرورگر) بگذرد. `google.com`، `youtube.com`، `fonts.googleapis.com` از قبل در این لیست هستند.
+- **User-Agent همیشه `Google-Apps-Script` است** برای هر چیزی که از رله رد می‌شود. `UrlFetchApp.fetch()` گوگل اجازهٔ تغییر این را نمی‌دهد. نتیجه: سایت‌هایی که ربات را تشخیص می‌دهند (مثل جست‌وجوی `google.com`، بعضی CAPTCHAها) نسخهٔ سادهٔ بدون JS را نشان می‌دهند. راه‌حل: دامنهٔ موردنظر را به `hosts` در `config.json` اضافه کنید تا از تونل SNI-rewrite (با UA واقعی مرورگر) رد شود. `google.com`، `youtube.com`، `fonts.googleapis.com` از قبل در این لیست هستند.
+- **پخش ویدیو کند است و سهمیه دارد** برای چیزهایی که از رله رد می‌شوند. HTML یوتوب از تونل می‌آید (سریع)، اما chunkهای ویدیو از `googlevideo.com` از طریق Apps Script می‌آیند. هر اکانت consumer گوگل روزانه ~۲ میلیون `UrlFetchApp` call و سقف ۵۰ مگابایت روی هر fetch دارد. برای مرور متنی عالی است، برای ۱۰۸۰p دردناک. چند `script_id` بگذارید، یا برای ویدیو از VPN واقعی استفاده کنید.
+- **Brotli فیلتر می‌شود** از header ارسالی `Accept-Encoding`. Apps Script می‌تواند gzip باز کند اما brotli نه، و اگر `br` را رد کنیم پاسخ خراب می‌شود. gzip فعال است. سربار حجمی جزئی.
+- **WebSocket کار نمی‌کند** از طریق رله (تک request/response JSON است). سایت‌هایی که به WS ارتقا می‌دهند fail می‌کنند (streaming ChatGPT، voice دیسکورد و غیره).
+- **سایت‌های HSTS-preloaded / pin-شده** گواهی MITM را قبول نمی‌کنند. اکثر سایت‌ها مشکلی ندارند چون CA ما trust شده، ولی چند مورد استثنا هستند.
+- **ورود دومرحله‌ای گوگل/یوتوب** ممکن است «دستگاه ناشناس» هشدار بدهد چون درخواست از IP Apps Script می‌آید نه IP شما. یک بار با تونل (`google.com` از قبل در لیست است) لاگین کنید.
 
-- **پخش ویدیو کند است و محدودیت سهمیه دارد** برای چیزهایی که از رله رد می‌شوند. صفحه HTML یوتوب از طریق تونل می‌آید (سریع)، ولی chunk‌های ویدیو از `googlevideo.com` از طریق Apps Script می‌آیند. هر اکانت Apps Script روزانه ~۲ میلیون فراخوانی و هر درخواست حداکثر ۵۰ مگابایت. برای متن مرور اوکی، برای ۱۰۸۰p دردناک. چند `script_id` بگذارید یا برای ویدیو از VPN واقعی استفاده کنید.
+### امنیت
 
-- **فشرده‌سازی Brotli فیلتر می‌شود**. Apps Script gzip می‌تواند باز کند ولی brotli نه.
-
-- **WebSocket کار نمی‌کند** (رله تک‌درخواستی است). پیام‌رسان‌ها و استریم OpenAI chat روی این کار نمی‌کنند.
-
-- **ورود دومرحله‌ای گوگل/یوتوب** ممکن است "دستگاه ناشناس" بگوید چون درخواست از IP Apps Script می‌آید نه IP شما. اول با تونل (`google.com` در لیست است) لاگین کنید.
+- ریشهٔ MITM **فقط روی سیستم شما می‌ماند**. کلید خصوصی `ca/ca.key` محلی ساخته می‌شود و هرگز از user-data dir خارج نمی‌شود.
+- `auth_key` بین کلاینت و Apps Script یک secret مشترک است که خودتان انتخاب می‌کنید. کد سرور (`Code.gs`) هر درخواستی را که این کلید را نداشته باشد رد می‌کند.
+- ترافیک بین سیستم شما و لبهٔ گوگل TLS 1.3 استاندارد است.
+- آنچه گوگل می‌بیند: URL و headerهای درخواست (چون Apps Script به‌جای شما fetch می‌کند). این دقیقاً همان trust model هر proxy میزبانی‌شده است — اگر قابل قبول نیست از VPN self-hosted استفاده کنید.
 
 ### اعتبار
 
-پروژه اصلی: <https://github.com/masterking32/MasterHttpRelayVPN> توسط [@masterking32](https://github.com/masterking32). تمام ایده، پروتکل Apps Script، و نگهداری متعلق به ایشان است. این پورت Rust فقط برای ساده کردن توزیع سمت کلاینت است.
+پروژهٔ اصلی: <https://github.com/masterking32/MasterHttpRelayVPN> توسط [@masterking32](https://github.com/masterking32). ایده، پروتکل Apps Script، معماری proxy و نگهداری همه متعلق به ایشان است. این پورت Rust فقط برای ساده‌کردن توزیع سمت کلاینت درست شده.
+
+</div>
