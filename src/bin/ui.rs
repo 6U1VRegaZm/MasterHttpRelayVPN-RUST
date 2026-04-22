@@ -131,6 +131,8 @@ struct FormState {
     sni_custom_input: String,
     /// Whether the floating SNI editor window is open.
     sni_editor_open: bool,
+    fetch_ips_from_api: bool,
+max_ips_to_scan: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -176,6 +178,8 @@ fn load_form() -> FormState {
             sni_pool,
             sni_custom_input: String::new(),
             sni_editor_open: false,
+            fetch_ips_from_api:c.fetch_ips_from_api,
+            max_ips_to_scan:c.max_ips_to_scan,
         }
     } else {
         FormState {
@@ -194,6 +198,8 @@ fn load_form() -> FormState {
             sni_pool: sni_pool_for_form(None, "www.google.com"),
             sni_custom_input: String::new(),
             sni_editor_open: false,
+            fetch_ips_from_api:false,
+            max_ips_to_scan:100,
         }
     }
 }
@@ -298,6 +304,8 @@ impl FormState {
                 // on an empty pool.
                 if active.is_empty() { None } else { Some(active) }
             },
+            fetch_ips_from_api:false,
+            max_ips_to_scan: 100,
         })
     }
 }
