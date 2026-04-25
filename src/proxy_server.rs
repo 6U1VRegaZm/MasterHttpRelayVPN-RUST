@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinSet;
 use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
@@ -577,9 +578,80 @@ struct SocksUdpTarget {
 /// Per-target relay session state shared between the dispatch loop and
 /// the per-session task. The dispatch loop pushes uplink datagrams via
 /// `uplink`; the task drains the upstream and serializes both directions
-/// onto a single tunnel-mux call at a time.
+/// onto a single tunnel-mux call at a time. `sid` is held here so the
+/// dispatch teardown path can issue close_session for any task it has
+/// to abort mid-await.
 struct UdpRelaySession {
+    sid: String,
     uplink: mpsc::Sender<Vec<u8>>,
+}
+
+/// All per-ASSOCIATE UDP relay state behind a single mutex so insertion
+/// order, the live-session map, and per-task self-removal can all stay
+/// consistent. Wrapping each separately invited a slow leak: the
+/// previous design's `insertion_order` deque was only pruned on
+/// overflow eviction, so a long-lived ASSOCIATE that opened many
+/// short-lived sessions accumulated dead `SocksUdpTarget` entries.
+struct UdpRelayState {
+    sessions: HashMap<SocksUdpTarget, UdpRelaySession>,
+    /// Insertion-order log for FIFO eviction. NOT a real LRU — repeated
+    /// uplinks to a hot session do not move it to the back. We keep it
+    /// in lockstep with `sessions` (insert appends; remove scans and
+    /// erases the matching entry — O(N) but N ≤ 256).
+    order: VecDeque<SocksUdpTarget>,
+}
+
+impl UdpRelayState {
+    fn new() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get_uplink(&self, target: &SocksUdpTarget) -> Option<mpsc::Sender<Vec<u8>>> {
+        self.sessions.get(target).map(|s| s.uplink.clone())
+    }
+
+    fn insert(&mut self, target: SocksUdpTarget, session: UdpRelaySession) {
+        self.order.push_back(target.clone());
+        self.sessions.insert(target, session);
+    }
+
+    fn remove(&mut self, target: &SocksUdpTarget) {
+        if let Some(pos) = self.order.iter().position(|t| t == target) {
+            self.order.remove(pos);
+        }
+        self.sessions.remove(target);
+    }
+
+    /// Pop the oldest session entries until `sessions.len() < cap`.
+    /// Stale `order` entries (already removed by self-cleanup on a
+    /// task's natural exit) are quietly skipped.
+    fn evict_until_under(&mut self, cap: usize) -> Vec<SocksUdpTarget> {
+        let mut evicted = Vec::new();
+        while self.sessions.len() >= cap {
+            let Some(victim) = self.order.pop_front() else {
+                break;
+            };
+            if self.sessions.remove(&victim).is_some() {
+                evicted.push(victim);
+            }
+        }
+        evicted
+    }
+
+    /// Snapshot live sids for the teardown close_session sweep. We
+    /// take a copy (not a drain) so the caller can decide whether to
+    /// also clear the map.
+    fn live_sids(&self) -> Vec<String> {
+        self.sessions.values().map(|s| s.sid.clone()).collect()
+    }
+
+    fn clear(&mut self) {
+        self.sessions.clear();
+        self.order.clear();
+    }
 }
 
 /// SOCKS5 UDP request frame: 4-byte header + atyp-specific address + 2-byte
@@ -608,9 +680,14 @@ const UDP_MAX_POLL_DELAY: Duration = Duration::from_secs(30);
 /// candidate gathering and DNS fanout produce dozens of distinct
 /// targets; an abusive or runaway client could produce thousands.
 /// 256 is generous for legitimate use and bounds tunnel-node UDP
-/// sessions a single ASSOCIATE can hold open. On overflow we evict
-/// the least-recently-inserted target (rough LRU — good enough for
-/// long-tail eviction without tracking access on the hot path).
+/// sessions a single ASSOCIATE can hold open.
+///
+/// Eviction policy is FIFO by insertion time, not true LRU — repeated
+/// uplinks to a hot session do not move it to the back. Real LRU
+/// would need a touch on every uplink (extra lock acquisition per
+/// datagram); the long-tail of dead targets gets cleaned up here just
+/// fine without that cost, and live targets are typically also recently
+/// inserted.
 const MAX_UDP_SESSIONS_PER_ASSOCIATE: usize = 256;
 
 /// Drop UDP datagrams larger than this (pre-base64). Standard MTU is
@@ -662,14 +739,16 @@ async fn handle_socks5_udp_associate(
     let mut buf = vec![0u8; SOCKS5_UDP_RECV_BUF_BYTES];
     let mut control_buf = [0u8; 1];
     let mut client_addr: Option<SocketAddr> = None;
-    let sessions: Arc<Mutex<HashMap<SocksUdpTarget, UdpRelaySession>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    // Insertion-order log used for LRU-on-overflow eviction. We track
-    // it alongside (rather than inside) the HashMap so eviction can
-    // run under the same lock as the cap check.
-    let mut insertion_order: VecDeque<SocksUdpTarget> = VecDeque::new();
+    let state: Arc<Mutex<UdpRelayState>> = Arc::new(Mutex::new(UdpRelayState::new()));
+    // Tracking per-target tasks here — instead of bare `tokio::spawn`
+    // — lets the teardown path call `abort_all()`, cancelling any
+    // in-flight `mux.udp_data` await. Without it, a task mid-poll
+    // could keep paying tunnel-node round trips for up to 5 s after
+    // the SOCKS5 client went away.
+    let mut tasks: JoinSet<()> = JoinSet::new();
     let mut oversized_dropped: u64 = 0;
     let mut sessions_evicted: u64 = 0;
+    let mut foreign_ip_drops: u64 = 0;
 
     loop {
         tokio::select! {
@@ -682,11 +761,32 @@ async fn handle_socks5_udp_associate(
                     }
                 };
                 // Source-IP check: anything not from the SOCKS5 client's
-                // host is dropped silently. After the first valid packet,
-                // also lock to its source port (RFC 1928 §6).
+                // host is dropped silently.
                 if peer.ip() != client_peer_ip {
+                    foreign_ip_drops += 1;
+                    if foreign_ip_drops == 1 || foreign_ip_drops.is_multiple_of(100) {
+                        tracing::debug!(
+                            "udp dropped from unauthorized source {}: count={}",
+                            peer.ip(),
+                            foreign_ip_drops,
+                        );
+                    }
                     continue;
                 }
+
+                // Parse BEFORE port-locking. A malformed datagram from
+                // the right IP must not pin client_addr to its source
+                // port — otherwise a co-tenant on the bind interface
+                // can race one bad packet to DoS the legitimate client
+                // (whose real datagram, sent from a different ephemeral
+                // port, would then be silently rejected).
+                let Some((target, payload)) = parse_socks5_udp_packet(&buf[..n]) else {
+                    continue;
+                };
+
+                // RFC 1928 §6: lock to the first VALID datagram's source
+                // port. Subsequent datagrams must come from the same
+                // (ip, port) pair.
                 if let Some(existing) = client_addr {
                     if existing != peer {
                         continue;
@@ -695,10 +795,6 @@ async fn handle_socks5_udp_associate(
                     tracing::info!("UDP relay locked to client {}", peer);
                     client_addr = Some(peer);
                 }
-
-                let Some((target, payload)) = parse_socks5_udp_packet(&buf[..n]) else {
-                    continue;
-                };
 
                 // Size guard: drop oversize datagrams before they reach
                 // the mux. Each datagram costs ~payload * 1.33 in the
@@ -721,38 +817,31 @@ async fn handle_socks5_udp_associate(
                 // Fast path: existing session — push payload onto its
                 // bounded uplink queue, drop on overflow (UDP semantics).
                 {
-                    let sess = sessions.lock().await;
-                    if let Some(session) = sess.get(&target) {
-                        let _ = session.uplink.try_send(payload);
+                    let st = state.lock().await;
+                    if let Some(uplink) = st.get_uplink(&target) {
+                        let _ = uplink.try_send(payload);
                         continue;
                     }
                 }
 
-                // Cap reached → evict the oldest session before opening
-                // a new one. The evicted target's `UdpRelaySession` is
-                // dropped here, which closes its uplink channel; the
-                // task then exits its select! and tells tunnel-node to
-                // close. Any in-flight uplink already in the channel is
-                // delivered before the task exits.
+                // Cap reached → evict oldest sessions before opening a
+                // new one. Each evicted entry drops its uplink Sender,
+                // which causes the per-session task to exit its select
+                // and tell tunnel-node to close. Any uplink already in
+                // that channel is delivered before the task exits.
                 {
-                    let mut sess = sessions.lock().await;
-                    while sess.len() >= MAX_UDP_SESSIONS_PER_ASSOCIATE {
-                        let Some(victim) = insertion_order.pop_front() else {
-                            break;
-                        };
-                        if sess.remove(&victim).is_some() {
-                            sessions_evicted += 1;
-                            if sessions_evicted == 1
-                                || sessions_evicted.is_multiple_of(50)
-                            {
-                                tracing::debug!(
-                                    "udp session cap {} reached; evicted {}:{} (total evicted={})",
-                                    MAX_UDP_SESSIONS_PER_ASSOCIATE,
-                                    victim.host,
-                                    victim.port,
-                                    sessions_evicted,
-                                );
-                            }
+                    let mut st = state.lock().await;
+                    let evicted = st.evict_until_under(MAX_UDP_SESSIONS_PER_ASSOCIATE);
+                    for victim in evicted {
+                        sessions_evicted += 1;
+                        if sessions_evicted == 1 || sessions_evicted.is_multiple_of(50) {
+                            tracing::debug!(
+                                "udp session cap {} reached; evicted {}:{} (total evicted={})",
+                                MAX_UDP_SESSIONS_PER_ASSOCIATE,
+                                victim.host,
+                                victim.port,
+                                sessions_evicted,
+                            );
                         }
                     }
                 }
@@ -787,9 +876,9 @@ async fn handle_socks5_udp_associate(
                 let task_mux = mux.clone();
                 let task_udp = udp.clone();
                 let task_target = target.clone();
-                let task_sessions = sessions.clone();
+                let task_state = state.clone();
                 let task_sid = sid.clone();
-                tokio::spawn(async move {
+                tasks.spawn(async move {
                     udp_session_task(
                         task_mux,
                         task_udp,
@@ -799,17 +888,21 @@ async fn handle_socks5_udp_associate(
                         uplink_rx,
                     )
                     .await;
-                    // On exit (eof / mux error / channel close) remove
-                    // ourselves from the dispatch map so a future packet
-                    // to the same target opens a fresh tunnel-node session.
-                    task_sessions.lock().await.remove(&task_target);
+                    // Natural-exit cleanup (eof / mux error / channel
+                    // close): remove from shared state so a future
+                    // packet to the same target opens a fresh session,
+                    // and so insertion_order doesn't leak. Skipped on
+                    // teardown since abort_all cancels this await point.
+                    task_state.lock().await.remove(&task_target);
                 });
 
-                insertion_order.push_back(target.clone());
-                sessions
-                    .lock()
-                    .await
-                    .insert(target, UdpRelaySession { uplink: uplink_tx });
+                state.lock().await.insert(
+                    target,
+                    UdpRelaySession {
+                        sid,
+                        uplink: uplink_tx,
+                    },
+                );
             }
             read = control.read(&mut control_buf) => {
                 match read {
@@ -820,10 +913,22 @@ async fn handle_socks5_udp_associate(
         }
     }
 
-    // Drop every uplink Sender. Each per-session task observes its
-    // receiver close, breaks out of select!, and issues close_session
-    // on the tunnel-node before exiting.
-    sessions.lock().await.clear();
+    // Teardown. Snapshot live sids first; they're authoritative for
+    // which tunnel-node sessions still exist. Then clear state — that
+    // drops every uplink Sender, so any task waiting on `recv()` wakes
+    // and exits naturally. Finally `abort_all` cancels tasks that were
+    // mid-`mux.udp_data` await; for those the natural-exit close won't
+    // run, so we send close_session here on their behalf.
+    let live_sids: Vec<String>;
+    {
+        let mut st = state.lock().await;
+        live_sids = st.live_sids();
+        st.clear();
+    }
+    tasks.abort_all();
+    for sid in live_sids {
+        mux.close_session(&sid).await;
+    }
     Ok(())
 }
 
