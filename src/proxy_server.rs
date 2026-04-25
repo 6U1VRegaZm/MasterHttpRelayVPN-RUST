@@ -872,6 +872,20 @@ async fn handle_socks5_udp_associate(
                 };
                 send_udp_response_packets(&udp, peer, &target, &resp).await;
 
+                // Tunnel-node may report eof on the open response if the
+                // upstream socket died between bind and the first drain
+                // (e.g., immediate ICMP unreachable). The session has
+                // already been reaped on that side — skip insert/spawn
+                // and let the next datagram from the client retry.
+                if resp.eof.unwrap_or(false) {
+                    tracing::debug!(
+                        "udp open {}:{} returned eof; not tracking session",
+                        target.host,
+                        target.port,
+                    );
+                    continue;
+                }
+
                 let (uplink_tx, uplink_rx) = mpsc::channel::<Vec<u8>>(UDP_UPLINK_QUEUE);
                 let task_mux = mux.clone();
                 let task_udp = udp.clone();
