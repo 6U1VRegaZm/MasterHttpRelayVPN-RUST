@@ -224,6 +224,8 @@ You can enable dynamic IP discovery by setting fetch_ips_from_api to true in con
 }
 ```
 
+
+
 When enabled:
 
 - Fetches goog.json from Google’s public IP ranges API
