@@ -157,6 +157,8 @@ sudo ./mhrv-rs --install-cert
 mhrv-rs.exe --install-cert
 ```
 
+
+
 Firefox keeps its own cert store; the installer also drops the CA into Firefox's NSS database via `certutil` (best-effort). If Firefox still complains, import `ca/ca.crt` manually via Settings → Privacy & Security → Certificates → View Certificates → Authorities → Import.
 
 ### Step 4 — Configure in the UI
