@@ -778,7 +778,9 @@ logread -e mhrv-rs -f
 
 ### اعتبار
 
-پروژهٔ اصلی: <https://github.com/masterking32/MasterHttpRelayVPN> توسط [@masterking32](https://github.com/masterking32). ایده، پروتکل `Apps Script`، و معماری پروکسی همه متعلق به ایشان است. این پورت `Rust` فقط برای ساده‌تر کردن توزیع سمت کلاینت درست شده.
+پروژهٔ اصلی: <https://github.com/masterking32/MasterHttpRelayVPN> توسط [@masterking32](https://github.com/masterking32). ایده، پروتکل `Apps Script`، و معماری پروکسی همه متعلق به ایشان است. این پورت `Rust` فقط برای ساده‌تر کردن توزیع سمت کلاینت درست شده
+
+
 
 ### حمایت از پروژه
 
